@@ -44,7 +44,7 @@ SEARCH_BLOCKED = [
     ("root", "shipping .md", "search.bad_doc_name"),
     ("root", "secrets.md", "search.unknown_doc"),
     ("???", None, "search.empty_query"),
-    ("refund​ policy", None, "search.hidden_chars"),
+    ("refund\u200b policy", None, "search.hidden_chars"),
     ("x" * 201, None, "search.query_too_long"),
 ]
 

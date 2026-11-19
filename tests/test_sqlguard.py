@@ -16,7 +16,7 @@ ALLOWED_SQL = [
     "SELECT replace(name, 'Tent', 'Shelter') FROM products",
     "SELECT name FROM customers WHERE name LIKE 'Ar%';",  # one trailing semicolon is fine
     "SELECT 1;;  ",
-    "SELECT 'café'",  # non-ASCII inside a string literal is fine
+    "SELECT 'caf\u00e9'",  # non-ASCII inside a string literal is fine
     "SELECT 1 UNION SELECT 2",
 ]
 
@@ -84,14 +84,14 @@ BLOCKED_SQL = [
     ("SELECT 1 /* unterminated", "sql.comment"),
     ("SEL/**/ECT 1", "sql.comment"),
     # invisible and non-ASCII characters
-    ("SELECT 1​; DROP TABLE orders", "sql.hidden_chars"),
-    ("SELECT name FROM customers WHERE tier = 'Gold'​; DROP TABLE orders", "sql.hidden_chars"),
-    ("SELECT 1 ‮", "sql.hidden_chars"),
-    ("﻿SELECT 1", "sql.hidden_chars"),
+    ("SELECT 1\u200b; DROP TABLE orders", "sql.hidden_chars"),
+    ("SELECT name FROM customers WHERE tier = 'Gold'\u200b; DROP TABLE orders", "sql.hidden_chars"),
+    ("SELECT 1 \u202e", "sql.hidden_chars"),
+    ("\ufeffSELECT 1", "sql.hidden_chars"),
     ("SELECT 1\x00; DROP TABLE x", "sql.hidden_chars"),
-    ("SELECT 'a⁠b'", "sql.hidden_chars"),
-    ("ＤＲＯＰ TABLE orders", "sql.non_ascii"),  # fullwidth DROP
-    ("SELECT 1", "sql.non_ascii"),                             # no-break space
+    ("SELECT 'a\u2060b'", "sql.hidden_chars"),
+    ("\uff24\uff32\uff2f\uff30 TABLE orders", "sql.non_ascii"),  # fullwidth DROP
+    ("SELECT\u00a01", "sql.non_ascii"),                             # no-break space
     # literals and odd characters
     ("SELECT 'unterminated", "sql.unterminated_literal"),
     ("SELECT \"x", "sql.unterminated_literal"),

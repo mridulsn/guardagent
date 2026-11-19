@@ -22,8 +22,8 @@ MAX_ROWS = 50
 # Control characters (except tab/newline/carriage return) and invisible Unicode
 # format characters: zero-width spaces/joiners, bidi overrides, BOM, soft hyphen.
 HIDDEN_CHARS = re.compile(
-    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f­؜᠎​-‏"
-    "‪-‮⁠-⁤⁦-⁯﻿]"
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u00ad\u061c\u180e\u200b-\u200f"
+    "\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]"
 )
 
 # Statement keywords that can change data, schema, connection state or

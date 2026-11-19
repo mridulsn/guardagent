@@ -25,8 +25,8 @@ DOC_NAME = re.compile(r"[a-z0-9-]{1,60}\.md")
 TRAVERSAL = re.compile(r"\.\.|[/\\~%:\x00]")
 QUERY_PATH = re.compile(r"\.\.[/\\]|%2e%2e|%2f", re.IGNORECASE)
 HIDDEN_CHARS = re.compile(
-    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f­؜᠎​-‏"
-    "‪-‮⁠-⁤⁦-⁯﻿]"
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u00ad\u061c\u180e\u200b-\u200f"
+    "\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]"
 )
 # Heuristic flag for text in a retrieved page that reads like instructions to
 # the model. Flagging only: the page is passed through unchanged, and the

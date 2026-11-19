@@ -42,8 +42,8 @@ CALC_BLOCKED = [
     ("1 < 2", "calc.bad_chars"),
     ("x = 1", "calc.bad_chars"),
     ("lambda: 1", "calc.bad_chars"),
-    ("١ + ١", "calc.bad_chars"),       # Arabic-Indic digits
-    ("1​+1", "calc.bad_chars"),
+    ("\u0661 + \u0661", "calc.bad_chars"),       # Arabic-Indic digits
+    ("1\u200b+1", "calc.bad_chars"),
     ("2 ^ 3", "calc.bad_chars"),
     ("0x10 + 1", "calc.number_format"),
     ("1j * 1j", "calc.number_format"),

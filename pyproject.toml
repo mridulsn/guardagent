@@ -1,7 +1,7 @@
 [project]
 name = "guardagent"
 version = "0.1.0"
-description = "Add your description here"
+description = "A tool-using Claude agent with a guard layer that validates every tool argument and blocks destructive actions"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

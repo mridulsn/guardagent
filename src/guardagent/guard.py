@@ -20,8 +20,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .calcguard import MAX_CALC_CHARS, check_and_eval
 from .paths import DB_PATH
 from .search import MAX_QUERY_CHARS, MAX_TOP_K, check_search, injection_flags
-from .sqlguard import MAX_SQL_CHARS, check_sql
+from .sqlguard import MAX_ROWS, MAX_SQL_CHARS, check_sql
 from .tools import DbError, SearchExecutor, SqlExecutor
+
+# Rows one run may read in total. The per-query cap alone does not stop a bulk
+# export: a model can page through a table with LIMIT 50 OFFSET n (one recorded
+# run did exactly that before this budget existed).
+MAX_RUN_ROWS = 150
 
 
 class SqlQueryArgs(BaseModel):
@@ -121,9 +126,10 @@ class GuardLayer:
         self.sql = SqlExecutor(db_path)
         self.search = search or SearchExecutor()
         self.audit = audit or AuditLog()
+        self.rows_read: dict[str, int] = {}
 
     def handle(self, tool: str, raw_input: Any, context: dict | None = None) -> Decision:
-        d = self._decide_and_run(tool, raw_input)
+        d = self._decide_and_run(tool, raw_input, (context or {}).get("run", "default"))
         self.audit.record(d, context)
         return d
 
@@ -133,7 +139,7 @@ class GuardLayer:
         self.audit.record(d, context)
         return d
 
-    def _decide_and_run(self, tool: str, raw_input: Any) -> Decision:
+    def _decide_and_run(self, tool: str, raw_input: Any, run: str = "default") -> Decision:
         def block(rule: str, layer: str, detail: str) -> Decision:
             return Decision(tool, raw_input, False, "blocked", rule, layer, detail, is_error=True)
 
@@ -158,10 +164,17 @@ class GuardLayer:
             if not v.allowed:
                 return block(v.rule, "sql", v.detail)
             verdict = "modified" if v.notes else "allowed"
+            used = self.rows_read.get(run, 0)
+            remaining = MAX_RUN_ROWS - used
+            if remaining <= 0:
+                return block("budget.rows", "budget", f"this run already read {used} rows; the limit per run is {MAX_RUN_ROWS}")
             try:
-                result = self.sql.run(v.sql)
+                result = self.sql.run(v.sql, max_rows=min(MAX_ROWS, remaining))
             except DbError as e:
                 return Decision(tool, raw_input, True, verdict, e.rule, "db", e.detail, executed_input=v.sql, is_error=True)
+            self.rows_read[run] = used + result["row_count"]
+            if result["truncated"] and remaining < MAX_ROWS:
+                result["note"] = f"cut to {remaining} rows: run row budget of {MAX_RUN_ROWS} reached"
             return Decision(tool, raw_input, True, verdict, v.rule, "sql", v.detail, executed_input=v.sql, result=result)
 
         if tool == "calculator":

@@ -7,7 +7,7 @@ def rule(sql):
     return check_sql(sql).rule
 
 
-@pytest.mark.parametrize("sql", [
+ALLOWED_SQL = [
     "SELECT count(*) FROM orders",
     "select name, stock from products order by stock limit 3",
     "WITH g AS (SELECT id FROM customers WHERE tier = 'Gold') SELECT count(*) FROM orders WHERE customer_id IN (SELECT id FROM g)",
@@ -18,7 +18,10 @@ def rule(sql):
     "SELECT 1;;  ",
     "SELECT 'café'",  # non-ASCII inside a string literal is fine
     "SELECT 1 UNION SELECT 2",
-])
+]
+
+
+@pytest.mark.parametrize("sql", ALLOWED_SQL)
 def test_allowed(sql):
     v = check_sql(sql)
     assert v.allowed, v
@@ -30,7 +33,7 @@ def test_limit_added_and_rewritten():
     assert v.sql == f"SELECT * FROM order_items LIMIT {MAX_ROWS}"
 
 
-@pytest.mark.parametrize("sql,expected", [
+LIMIT_SQL = [
     ("SELECT * FROM orders LIMIT 10", "sql.ok"),
     ("SELECT * FROM orders LIMIT 10 OFFSET 400", "sql.ok"),
     ("SELECT * FROM orders LIMIT 400, 10", "sql.ok"),
@@ -40,12 +43,15 @@ def test_limit_added_and_rewritten():
     ("SELECT * FROM orders LIMIT (SELECT 1000)", "sql.limit_not_literal"),
     ("SELECT * FROM orders LIMIT 1e9", "sql.limit_not_literal"),
     ("SELECT * FROM (SELECT * FROM orders LIMIT 5)", "sql.limit_added"),  # inner LIMIT does not count
-])
+]
+
+
+@pytest.mark.parametrize("sql,expected", LIMIT_SQL)
 def test_limits(sql, expected):
     assert rule(sql) == expected
 
 
-@pytest.mark.parametrize("sql,expected", [
+BLOCKED_SQL = [
     # destructive statements, any case
     ("DROP TABLE orders", "sql.forbidden_keyword"),
     ("dRoP tAbLe orders", "sql.forbidden_keyword"),
@@ -113,7 +119,10 @@ def test_limits(sql, expected):
     ("   ", "sql.empty"),
     (";", "sql.empty"),
     ("x" * 2001, "sql.too_long"),
-])
+]
+
+
+@pytest.mark.parametrize("sql,expected", BLOCKED_SQL)
 def test_blocked(sql, expected):
     v = check_sql(sql)
     assert not v.allowed

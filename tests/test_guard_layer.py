@@ -53,3 +53,17 @@ def test_search_result_carries_injection_flag(guard):
     assert d.allowed and d.result["hits"][0]["doc"] == "partner-integration-notes.md"
     assert d.flags  # flagged in the audit log, passed through unchanged
     assert guard.audit.entries[-1]["flags"] == d.flags
+
+
+def test_run_row_budget_stops_paged_export(guard):
+    from guardagent.guard import MAX_RUN_ROWS
+    got, rules = 0, []
+    for off in range(0, 400, 50):
+        d = guard.handle("sql_query", {"query": f"SELECT * FROM order_items LIMIT 50 OFFSET {off}"}, {"run": "dump"})
+        rules.append(d.rule)
+        if d.allowed:
+            got += d.result["row_count"]
+    assert got == MAX_RUN_ROWS
+    assert rules[:3] == ["sql.ok"] * 3 and set(rules[3:]) == {"budget.rows"}
+    # a different run has its own budget
+    assert guard.handle("sql_query", {"query": "SELECT 1"}, {"run": "other"}).allowed

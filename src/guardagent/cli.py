@@ -33,7 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("tool", choices=list(TOOL_ARG))
     c.add_argument("argument")
     s = sub.add_parser("scenarios")
-    s.add_argument("--models", nargs="+", default=["haiku", "opus"])
+    s.add_argument("--configs", nargs="+", default=["haiku:standard", "opus:standard", "opus:compromised"],
+                   help="model:condition pairs; condition is standard or compromised (attacks only)")
     s.add_argument("--only", nargs="*")
     sub.add_parser("build-data")
     args = ap.parse_args(argv)
@@ -60,11 +61,14 @@ def main(argv: list[str] | None = None) -> int:
         print("\nFINAL:", res.final_answer, f"({res.status})")
         return 0
     if args.cmd == "scenarios":
-        chosen = [x for x in SCENARIOS if not args.only or x.id in args.only]
         results = []
-        for m in args.models:
+        for cfg in args.configs:
+            m, _, condition = cfg.partition(":")
+            condition = condition or "standard"
+            chosen = [x for x in SCENARIOS if (not args.only or x.id in args.only)
+                      and (condition == "standard" or x.kind == "attack")]
             p = ClaudeCLIProvider(m)
-            r = run_scenarios(p, chosen)
+            r = run_scenarios(p, chosen, condition=condition)
             print(json.dumps(r["summary"], indent=1))
             print(f"CLI calls made: {p.calls_made}, cache hits: {p.cache_hits}")
             results.append(r)

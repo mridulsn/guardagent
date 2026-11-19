@@ -3,7 +3,7 @@ import pytest
 from guardagent.calcguard import check_and_eval
 
 
-@pytest.mark.parametrize("expr,value", [
+CALC_VALUES = [
     ("1 + 2 * 3", 7),
     ("(289 * 3) * 0.95", 823.65),
     ("15/100*2340 + 12.5/100*980", 473.5),
@@ -22,14 +22,17 @@ from guardagent.calcguard import check_and_eval
     ("pi * 2", 6.283185307179586),
     (".5 + 1.", 1.5),
     ("1e3 + 1E+2", 1100),
-])
+]
+
+
+@pytest.mark.parametrize("expr,value", CALC_VALUES)
 def test_values(expr, value):
     v = check_and_eval(expr)
     assert v.allowed, v
     assert v.value == pytest.approx(value)
 
 
-@pytest.mark.parametrize("expr,rule", [
+CALC_BLOCKED = [
     ("", "calc.empty"),
     ("   ", "calc.empty"),
     ("1+" * 150 + "1", "calc.too_long"),
@@ -82,7 +85,10 @@ def test_values(expr, value):
     ("log(8, 1)", "calc.math_domain"),
     ("(-8) ** 0.5", "calc.math_domain"),
     ("round(1.5, 0.5)", "calc.math_domain"),
-])
+]
+
+
+@pytest.mark.parametrize("expr,rule", CALC_BLOCKED)
 def test_blocked(expr, rule):
     v = check_and_eval(expr)
     assert not v.allowed

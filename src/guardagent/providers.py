@@ -56,6 +56,7 @@ class ModelTurn:
     final_answer: str | None = None
     stop_reason: str = ""
     protocol_error: str | None = None
+    protocol_note: str | None = None
     refusal: str | None = None
     usage: dict = field(default_factory=dict)
 
@@ -170,34 +171,43 @@ def render_tools_for_cli(tools: list[dict]) -> str:
     return json.dumps(slim, indent=1, ensure_ascii=True)
 
 
-def parse_cli_reply(text: str) -> tuple[dict | None, str | None]:
-    """Parse the model's reply into the protocol object. Returns (obj, error)."""
+def parse_cli_reply(text: str) -> tuple[dict | None, str | None, str | None]:
+    """Parse the model's reply into the protocol object.
+
+    Returns (obj, error, note). The reply must START with the JSON object (code
+    fences tolerated). Text after the first complete object is discarded and
+    reported in `note`: models sometimes keep going and write an imagined
+    tool result, which must never be treated as real.
+    """
     s = text.strip()
     if s.startswith("```"):
-        s = s.strip("`")
+        s = s[3:]
         s = s[4:] if s.lower().startswith("json") else s
-        s = s.strip()
+        end = s.rfind("```")
+        s = (s[:end] if end != -1 else s).strip()
     try:
-        obj = json.loads(s)
+        obj, end = json.JSONDecoder().raw_decode(s)
     except json.JSONDecodeError as e:
-        return None, f"reply is not a single JSON object ({e.msg} at char {e.pos})"
+        return None, f"reply is not a single JSON object ({e.msg} at char {e.pos})", None
+    rest = s[end:].strip()
+    note = f"discarded {len(rest)} characters after the JSON object" if rest else None
     if not isinstance(obj, dict):
-        return None, "reply must be a JSON object"
+        return None, "reply must be a JSON object", note
     has_calls, has_final = "tool_calls" in obj, "final_answer" in obj
     if has_calls == has_final:
-        return None, "reply must contain exactly one of tool_calls or final_answer"
+        return None, "reply must contain exactly one of tool_calls or final_answer", note
     if has_final and not isinstance(obj["final_answer"], str):
-        return None, "final_answer must be a string"
+        return None, "final_answer must be a string", note
     if has_calls:
         calls = obj["tool_calls"]
         if not isinstance(calls, list) or not calls:
-            return None, "tool_calls must be a non-empty list"
+            return None, "tool_calls must be a non-empty list", note
         if len(calls) > MAX_TOOL_CALLS_PER_TURN:
-            return None, f"at most {MAX_TOOL_CALLS_PER_TURN} tool calls per reply"
+            return None, f"at most {MAX_TOOL_CALLS_PER_TURN} tool calls per reply", note
         for c in calls:
             if not isinstance(c, dict) or not isinstance(c.get("name"), str) or "input" not in c:
-                return None, "each tool call needs a string name and an input"
-    return obj, None
+                return None, "each tool call needs a string name and an input", note
+    return obj, None, note
 
 
 class ClaudeCLIProvider:
@@ -283,9 +293,13 @@ class CLISession:
         prompt = "<conversation>\n" + "\n\n".join(self.transcript) + "\n</conversation>\n\n" + tail
         rec = self.p.complete(self.system, prompt)
         text = rec["result"] or ""
-        self.transcript.append(f"[assistant]\n{text.strip()}")
         turn = ModelTurn(raw=text, text=text, stop_reason=rec.get("stop_reason") or "", usage=rec["usage"])
-        obj, err = parse_cli_reply(text)
+        obj, err, note = parse_cli_reply(text)
+        turn.protocol_note = note
+        # The transcript keeps only the parsed object, so anything the model wrote
+        # after it (such as an invented tool result) never reaches the next turn.
+        kept = json.dumps(obj, ensure_ascii=False) if (obj is not None and note) else text.strip()
+        self.transcript.append("[assistant]\n" + kept)
         if err:
             turn.protocol_error = err
             return turn

@@ -110,7 +110,7 @@ class SqlExecutor:
     def __init__(self, db_path: Path):
         self.db_path = db_path
 
-    def run(self, sql: str) -> dict:
+    def run(self, sql: str, max_rows: int = MAX_ROWS) -> dict:
         con = open_readonly(self.db_path)
         steps = {"n": 0}
 
@@ -121,7 +121,7 @@ class SqlExecutor:
         con.set_progress_handler(progress, 1000)
         try:
             cur = con.execute(sql)
-            rows = cur.fetchmany(MAX_ROWS + 1)
+            rows = cur.fetchmany(max_rows + 1)
             cols = [d[0] for d in cur.description or []]
         except sqlite3.DatabaseError as e:
             msg = str(e)
@@ -132,9 +132,9 @@ class SqlExecutor:
             raise DbError("db.error", msg)
         finally:
             con.close()
-        truncated = len(rows) > MAX_ROWS
-        return {"columns": cols, "rows": [list(r) for r in rows[:MAX_ROWS]],
-                "row_count": min(len(rows), MAX_ROWS), "truncated": truncated}
+        truncated = len(rows) > max_rows
+        return {"columns": cols, "rows": [list(r) for r in rows[:max_rows]],
+                "row_count": min(len(rows), max_rows), "truncated": truncated}
 
 
 class SearchExecutor:

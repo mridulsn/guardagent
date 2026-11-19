@@ -30,7 +30,7 @@ def test_allowed(names):
     assert v.allowed and v.doc == "shipping.md"
 
 
-@pytest.mark.parametrize("query,doc,rule", [
+SEARCH_BLOCKED = [
     ("root", "../../../etc/passwd", "search.path_traversal"),
     ("root", "..\\..\\windows\\win.ini", "search.path_traversal"),
     ("root", "/etc/passwd", "search.path_traversal"),
@@ -46,7 +46,10 @@ def test_allowed(names):
     ("???", None, "search.empty_query"),
     ("refund​ policy", None, "search.hidden_chars"),
     ("x" * 201, None, "search.query_too_long"),
-])
+]
+
+
+@pytest.mark.parametrize("query,doc,rule", SEARCH_BLOCKED)
 def test_blocked(names, query, doc, rule):
     v = check_search(query, doc, names)
     assert not v.allowed

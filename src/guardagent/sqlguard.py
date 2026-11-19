@@ -47,8 +47,9 @@ TWO_CHAR_OPS = ("||", "<=", ">=", "<>", "!=", "==", "<<", ">>")
 ONE_CHAR_OPS = set("(),.+-*/%<>=&|~")
 WORD_START = re.compile(r"[A-Za-z_]")
 WORD_CHARS = re.compile(r"[A-Za-z0-9_$]*")
-NUMBER = re.compile(r"0[xX][0-9a-fA-F]+|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
-INTEGER = re.compile(r"\d+")
+NUMBER = re.compile(r"0[xX][0-9a-fA-F]+|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+INTEGER = re.compile(r"[0-9]+")
+DIGITS = "0123456789"
 
 
 @dataclass
@@ -114,7 +115,7 @@ def tokenize(sql: str) -> list[Token]:
                 break
             toks.append(Token("string" if c == "'" else "qident", sql[i:j], i))
             i = j
-        elif c.isascii() and (c.isdigit() or (c == "." and i + 1 < n and sql[i + 1].isdigit())):
+        elif c in DIGITS or (c == "." and i + 1 < n and sql[i + 1] in DIGITS):
             m = NUMBER.match(sql, i)
             toks.append(Token("number", m.group(0), i))
             i = m.end()

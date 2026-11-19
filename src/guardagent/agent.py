@@ -19,7 +19,6 @@ from .tools import TOOL_SPECS
 
 MAX_STEPS = 6
 MAX_TOOL_CALLS = 10
-RESULT_PREVIEW_CHARS = 1500
 
 SYSTEM_PROMPT = """\
 You are the data assistant for Quillmoor Supply Co., a fictional outdoor gear retailer.
@@ -58,10 +57,6 @@ class RunResult:
     audit: list[dict] = field(default_factory=list)
     model_calls: int = 0
     tool_calls: int = 0
-
-
-def _preview(text: str) -> str:
-    return text if len(text) <= RESULT_PREVIEW_CHARS else text[:RESULT_PREVIEW_CHARS] + f"... [{len(text)} chars]"
 
 
 def run_agent(provider, question: str, guard: GuardLayer | None = None, max_steps: int = MAX_STEPS,
@@ -121,7 +116,9 @@ def run_agent(provider, question: str, guard: GuardLayer | None = None, max_step
             else:
                 d = guard.handle(call.name, call.input, ctx)
                 res.tool_calls += 1
-            content = _preview(d.result_text())
+            # The model gets the whole result (cut by structure only above
+            # MODEL_RESULT_CHARS), and the trace records exactly what it got.
+            content = d.result_text()
             rec["tool_calls"].append({
                 "id": call.id, "name": call.name, "input": call.input,
                 "verdict": d.verdict, "rule": d.rule, "layer": d.layer, "detail": d.detail,

@@ -42,6 +42,10 @@ FORBIDDEN_FUNCTIONS = frozenset({
 })
 
 ALLOWED_START = frozenset({"SELECT", "WITH"})
+SYSTEM_PREFIXES = ("sqlite_", "pragma_")
+# Keywords that end a FROM clause at the same parenthesis depth.
+CLAUSE_END = frozenset({"WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "UNION", "INTERSECT",
+                        "EXCEPT", "SELECT", "VALUES"})
 
 TWO_CHAR_OPS = ("||", "<=", ">=", "<>", "!=", "==", "<<", ">>")
 ONE_CHAR_OPS = set("(),.+-*/%<>=&|~")
@@ -145,6 +149,89 @@ def _unquote(tok: Token) -> str:
     return tok.text[1:-1]
 
 
+def _ident(tok: Token) -> str:
+    """Lower-case name of a word or quoted token, with doubled quotes collapsed."""
+    if tok.kind == "word":
+        return tok.text.lower()
+    if tok.kind in ("qident", "string"):
+        q = tok.text[0]
+        inner = _unquote(tok)
+        return (inner if q == "[" else inner.replace(q + q, q)).lower()
+    return ""
+
+
+def _object_position(sig: list[Token], idx: int, clause: dict, depth: int) -> bool:
+    """True when the token at idx sits where SQLite expects a table name."""
+    prev = sig[idx - 1] if idx > 0 else None
+    nxt = sig[idx + 1] if idx + 1 < len(sig) else None
+    if (nxt is not None and nxt.text == ".") or (prev is not None and prev.text == "."):
+        return True
+    if prev is None:
+        return False
+    if prev.kind == "word" and prev.upper == "JOIN":
+        return True
+    if prev.kind == "word" and prev.upper == "FROM":
+        before = sig[idx - 2] if idx > 1 else None
+        return not (before is not None and before.upper == "DISTINCT")
+    if prev.text == ",":
+        return clause.get(depth) in ("from", "on")
+    if prev.text == "(":
+        return clause.get(depth) == "from"
+    return False
+
+
+def _skip_parens(sig: list[Token], i: int) -> int:
+    """sig[i] is '('; return the index just after its matching ')'."""
+    depth = 0
+    while i < len(sig):
+        if sig[i].text == "(":
+            depth += 1
+        elif sig[i].text == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise SqlBlocked("sql.not_select", "unbalanced parentheses in the WITH clause")
+
+
+def _check_cte_statement(sig: list[Token]) -> None:
+    """WITH name [(cols)] AS [NOT] [MATERIALIZED] (...) [, ...] must be followed by SELECT.
+
+    SQLite also accepts INSERT, REPLACE, UPDATE and DELETE after a CTE, and
+    REPLACE cannot go on the keyword denylist because replace() is a function.
+    """
+    def bad(detail: str):
+        raise SqlBlocked("sql.not_select", detail)
+
+    i, n = 1, len(sig)
+    if i < n and sig[i].upper == "RECURSIVE":
+        i += 1
+    while True:
+        if i >= n or sig[i].kind not in ("word", "qident", "string"):
+            bad("could not read the WITH clause; expected a CTE name")
+        i += 1
+        if i < n and sig[i].text == "(":
+            i = _skip_parens(sig, i)
+        if i >= n or sig[i].upper != "AS":
+            bad("could not read the WITH clause; expected AS")
+        i += 1
+        if i < n and sig[i].upper == "NOT":
+            i += 1
+        if i < n and sig[i].upper == "MATERIALIZED":
+            i += 1
+        if i >= n or sig[i].text != "(":
+            bad("could not read the WITH clause; expected ( after AS")
+        i = _skip_parens(sig, i)
+        if i < n and sig[i].text == ",":
+            i += 1
+            continue
+        break
+    if i >= n:
+        bad("WITH clause is not followed by a statement")
+    if not (sig[i].kind == "word" and sig[i].upper == "SELECT"):
+        bad(f"the statement after the WITH clause starts with {sig[i].text!r}; only SELECT is allowed")
+
+
 def check_sql(sql: str, max_rows: int = MAX_ROWS) -> SqlVerdict:
     try:
         return _check(sql, max_rows)
@@ -184,15 +271,43 @@ def _check(sql: str, max_rows: int) -> SqlVerdict:
     if not (sig[0].kind == "word" and sig[0].upper in ALLOWED_START):
         raise SqlBlocked("sql.not_select", f"statement starts with {sig[0].text!r}; only SELECT (optionally WITH ... SELECT) is allowed")
 
+    if sig[0].upper == "WITH":
+        _check_cte_statement(sig)
+
+    clause: dict[int, str | None] = {0: None}  # per paren depth: "from", "on" or None
+    depth = 0
     for idx, t in enumerate(sig):
-        if t.kind == "word" and t.text.lower() in FORBIDDEN_FUNCTIONS:
-            nxt = sig[idx + 1] if idx + 1 < len(sig) else None
-            if nxt is not None and nxt.text == "(":
-                raise SqlBlocked("sql.forbidden_function", f"function {t.text.lower()}() is not allowed")
-        # SQLite also accepts a quoted name, and even a 'string', as a table name.
-        name = t.text.lower() if t.kind == "word" else _unquote(t).lower() if t.kind in ("qident", "string") else ""
-        if name.startswith("sqlite_") or name.startswith("pragma_"):
-            raise SqlBlocked("sql.system_table", f"{name} is an internal SQLite object; use the documented schema")
+        prev = sig[idx - 1] if idx > 0 else None
+        nxt = sig[idx + 1] if idx + 1 < len(sig) else None
+        if t.kind in ("word", "qident", "string") and nxt is not None and nxt.text == "(":
+            # A quoted name ("randomblob", [randomblob], `randomblob`) calls the same function.
+            fname = _ident(t)
+            if fname in FORBIDDEN_FUNCTIONS:
+                raise SqlBlocked("sql.forbidden_function", f"function {fname}() is not allowed")
+        if t.kind in ("word", "qident") or (t.kind == "string" and _object_position(sig, idx, clause, depth)):
+            # Identifiers always name objects. A 'string' only does where SQLite reads it as a
+            # table name (FROM 'sqlite_master'); elsewhere it is a harmless literal value.
+            name = _ident(t)
+            if name.startswith(SYSTEM_PREFIXES):
+                raise SqlBlocked("sql.system_table", f"{name} is an internal SQLite object; use the documented schema")
+        if t.text == "(":
+            clause[depth + 1] = "from" if _object_position(sig, idx, clause, depth) else None
+            depth += 1
+        elif t.text == ")":
+            clause.pop(depth, None)
+            depth -= 1
+        elif t.kind == "word":
+            u = t.upper
+            if u == "FROM" and not (prev is not None and prev.upper == "DISTINCT"):
+                clause[depth] = "from"
+            elif u == "JOIN":
+                clause[depth] = "from"
+            elif u in ("ON", "USING"):
+                clause[depth] = "on"
+            elif u in CLAUSE_END:
+                clause[depth] = None
+        elif t.text == "," and clause.get(depth) == "on":
+            clause[depth] = "from"  # a comma after a join constraint starts another table
 
     # Row limit: find LIMIT at parenthesis depth 0.
     depth, limit_at = 0, None

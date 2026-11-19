@@ -21,12 +21,19 @@
     return "U+" + cp;
   }
   function Blocked(rule, detail) { this.rule = rule; this.detail = detail; }
+  // Length in Unicode code points, as Python's len() counts (JS .length counts UTF-16 units).
+  function cpLen(s) { var n = 0; for (var ch of s) n++; return n; }
+  function own(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
 
   // ------------------------------------------------------------------ SQL guard
   var FORBIDDEN_KEYWORDS = {};
   ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH", "PRAGMA", "VACUUM",
    "REINDEX", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "TRUNCATE", "GRANT", "REVOKE",
    "UPSERT", "MERGE"].forEach(function (k) { FORBIDDEN_KEYWORDS[k] = true; });
+  var SYSTEM_PREFIXES = ["sqlite_", "pragma_"];
+  var CLAUSE_END = {};
+  ["WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "UNION", "INTERSECT", "EXCEPT", "SELECT", "VALUES"]
+    .forEach(function (k) { CLAUSE_END[k] = true; });
   var FORBIDDEN_FUNCTIONS = {};
   ["load_extension", "readfile", "writefile", "edit", "fts3_tokenizer", "randomblob", "zeroblob",
    "sqlite_compileoption_get", "sqlite_offset"].forEach(function (k) { FORBIDDEN_FUNCTIONS[k] = true; });
@@ -89,7 +96,8 @@
   }
 
   function sqlCheck(sql, maxRows) {
-    if (sql.length > MAX_SQL_CHARS) throw new Blocked("sql.too_long", sql.length + " characters, limit is " + MAX_SQL_CHARS);
+    var sqlLen = cpLen(sql);
+    if (sqlLen > MAX_SQL_CHARS) throw new Blocked("sql.too_long", sqlLen + " characters, limit is " + MAX_SQL_CHARS);
     var hm = HIDDEN_CHARS.exec(sql);
     if (hm) throw new Blocked("sql.hidden_chars", "invisible or control character " + hex(hm[0]) + " at position " + hm.index);
     var toks = sqlTokenize(sql), i, t;
@@ -105,20 +113,39 @@
     }
     for (i = 0; i < sig.length; i++) {
       t = sig[i];
-      if (t.kind === "word" && FORBIDDEN_KEYWORDS[t.text.toUpperCase()]) throw new Blocked("sql.forbidden_keyword", t.text.toUpperCase() + " is not allowed; this tool is read-only");
+      if (t.kind === "word" && own(FORBIDDEN_KEYWORDS, t.text.toUpperCase())) throw new Blocked("sql.forbidden_keyword", t.text.toUpperCase() + " is not allowed; this tool is read-only");
     }
     var first = sig[0];
     if (!(first.kind === "word" && (first.text.toUpperCase() === "SELECT" || first.text.toUpperCase() === "WITH"))) {
       throw new Blocked("sql.not_select", "statement starts with '" + first.text + "'; only SELECT (optionally WITH ... SELECT) is allowed");
     }
+    if (first.text.toUpperCase() === "WITH") checkCteStatement(sig);
+    var clause = { 0: null }, depth0 = 0, prev, nxt, u;
     for (i = 0; i < sig.length; i++) {
-      t = sig[i];
-      if (t.kind === "word" && FORBIDDEN_FUNCTIONS[t.text.toLowerCase()]) {
-        var nxt = sig[i + 1];
-        if (nxt && nxt.text === "(") throw new Blocked("sql.forbidden_function", "function " + t.text.toLowerCase() + "() is not allowed");
+      t = sig[i]; prev = i > 0 ? sig[i - 1] : null; nxt = i + 1 < sig.length ? sig[i + 1] : null;
+      if ((t.kind === "word" || t.kind === "qident" || t.kind === "string") && nxt && nxt.text === "(") {
+        var fname = sqlIdent(t);
+        if (own(FORBIDDEN_FUNCTIONS, fname)) throw new Blocked("sql.forbidden_function", "function " + fname + "() is not allowed");
       }
-      var name = t.kind === "word" ? t.text.toLowerCase() : (t.kind === "qident" || t.kind === "string") ? t.text.slice(1, -1).toLowerCase() : "";
-      if (name.indexOf("sqlite_") === 0 || name.indexOf("pragma_") === 0) throw new Blocked("sql.system_table", name + " is an internal SQLite object; use the documented schema");
+      if (t.kind === "word" || t.kind === "qident" || (t.kind === "string" && objectPosition(sig, i, clause, depth0))) {
+        var name = sqlIdent(t);
+        if (name.indexOf("sqlite_") === 0 || name.indexOf("pragma_") === 0) throw new Blocked("sql.system_table", name + " is an internal SQLite object; use the documented schema");
+      }
+      if (t.text === "(") {
+        clause[depth0 + 1] = objectPosition(sig, i, clause, depth0) ? "from" : null;
+        depth0++;
+      } else if (t.text === ")") {
+        delete clause[depth0];
+        depth0--;
+      } else if (t.kind === "word") {
+        u = t.text.toUpperCase();
+        if (u === "FROM" && !(prev && prev.text.toUpperCase() === "DISTINCT")) clause[depth0] = "from";
+        else if (u === "JOIN") clause[depth0] = "from";
+        else if (u === "ON" || u === "USING") clause[depth0] = "on";
+        else if (own(CLAUSE_END, u)) clause[depth0] = null;
+      } else if (t.text === "," && clause[depth0] === "on") {
+        clause[depth0] = "from";
+      }
     }
     var depth = 0, limitAt = -1;
     for (i = 0; i < sig.length; i++) {
@@ -133,6 +160,62 @@
     var count = parseLimitTail(sig.slice(limitAt + 1));
     if (count > maxRows) throw new Blocked("sql.limit_too_large", "LIMIT " + count + " is above the cap of " + maxRows + " rows");
     return { allowed: true, rule: "sql.ok", detail: "single read-only SELECT", sql: body };
+  }
+
+  function sqlIdent(t) {
+    if (t.kind === "word") return t.text.toLowerCase();
+    if (t.kind === "qident" || t.kind === "string") {
+      var q = t.text[0], inner = t.text.slice(1, -1);
+      return (q === "[" ? inner : inner.split(q + q).join(q)).toLowerCase();
+    }
+    return "";
+  }
+
+  function objectPosition(sig, idx, clause, depth) {
+    var prev = idx > 0 ? sig[idx - 1] : null, nxt = idx + 1 < sig.length ? sig[idx + 1] : null;
+    if ((nxt && nxt.text === ".") || (prev && prev.text === ".")) return true;
+    if (!prev) return false;
+    if (prev.kind === "word" && prev.text.toUpperCase() === "JOIN") return true;
+    if (prev.kind === "word" && prev.text.toUpperCase() === "FROM") {
+      var before = idx > 1 ? sig[idx - 2] : null;
+      return !(before && before.text.toUpperCase() === "DISTINCT");
+    }
+    if (prev.text === ",") return clause[depth] === "from" || clause[depth] === "on";
+    if (prev.text === "(") return clause[depth] === "from";
+    return false;
+  }
+
+  function skipParens(sig, i) {
+    var depth = 0;
+    while (i < sig.length) {
+      if (sig[i].text === "(") depth++;
+      else if (sig[i].text === ")") { depth--; if (depth === 0) return i + 1; }
+      i++;
+    }
+    throw new Blocked("sql.not_select", "unbalanced parentheses in the WITH clause");
+  }
+
+  // WITH name [(cols)] AS [NOT] [MATERIALIZED] (...) [, ...] must be followed by SELECT.
+  function checkCteStatement(sig) {
+    function bad(detail) { throw new Blocked("sql.not_select", detail); }
+    function up(k) { return k < sig.length ? sig[k].text.toUpperCase() : ""; }
+    var i = 1, n = sig.length;
+    if (up(i) === "RECURSIVE") i++;
+    for (;;) {
+      if (i >= n || ["word", "qident", "string"].indexOf(sig[i].kind) < 0) bad("could not read the WITH clause; expected a CTE name");
+      i++;
+      if (i < n && sig[i].text === "(") i = skipParens(sig, i);
+      if (up(i) !== "AS" || i >= n) bad("could not read the WITH clause; expected AS");
+      i++;
+      if (up(i) === "NOT") i++;
+      if (up(i) === "MATERIALIZED") i++;
+      if (i >= n || sig[i].text !== "(") bad("could not read the WITH clause; expected ( after AS");
+      i = skipParens(sig, i);
+      if (i < n && sig[i].text === ",") { i++; continue; }
+      break;
+    }
+    if (i >= n) bad("WITH clause is not followed by a statement");
+    if (!(sig[i].kind === "word" && sig[i].text.toUpperCase() === "SELECT")) bad("the statement after the WITH clause starts with '" + sig[i].text + "'; only SELECT is allowed");
   }
 
   function parseLimitTail(tail) {
@@ -150,7 +233,7 @@
   // Python's ast is not available here, so this is a small parser that follows
   // Python's grammar for the allowed subset and refuses everything else.
   var CALC_ALLOWED = /^[0-9A-Za-z_ \t.,+\-*/%()]*$/;
-  var CALC_NUMBER_FORMAT = /\b0[xXoObB][0-9a-fA-F]|\d[jJ]\b|\d_\d/;
+  var CALC_NUMBER_FORMAT = /\b0[xXoObB]|\d[jJ]\b|\d_\d/;
   var FUNCTIONS = { abs: [1, 1], round: [1, 2], min: [2, 10], max: [2, 10], sqrt: [1, 1], log: [1, 2] };
   var CONSTANTS = { pi: Math.PI, e: Math.E };
   var PY_KEYWORDS = { "True": 1, "False": 1, "None": 1, "not": 1, "and": 1, "or": 1, "if": 1, "else": 1, "in": 1, "is": 1, "for": 1, "lambda": 1 };
@@ -162,7 +245,11 @@
       if (c === " " || c === "\t") { i++; continue; }
       rest = s.slice(i);
       m = /^(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?/.exec(rest);
-      if (m) { toks.push({ t: "num", v: m[0] }); i += m[0].length; continue; }
+      if (m) {
+        // Python: "leading zeros in decimal integer literals are not permitted" (01, 007; 00 is fine)
+        if (/^0+[1-9][0-9]*$/.test(m[0])) throw new Blocked("calc.syntax", "could not parse: leading zeros in decimal integer literals are not permitted");
+        toks.push({ t: "num", v: m[0] }); i += m[0].length; continue;
+      }
       m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest);
       if (m) { toks.push({ t: "name", v: m[0] }); i += m[0].length; continue; }
       if (rest.slice(0, 2) === "**" || rest.slice(0, 2) === "//") { toks.push({ t: "op", v: rest.slice(0, 2) }); i += 2; continue; }
@@ -209,7 +296,7 @@
               if (isOp("*") || isOp("**")) notAllowed("Argument unpacking");
               args.push(arith());
               var nt = peek();
-              if (nt && nt.t === "name" && PY_KEYWORDS[nt.v]) notAllowed(nt.v);
+              if (nt && nt.t === "name" && own(PY_KEYWORDS, nt.v)) notAllowed(nt.v);
               if (isOp(",")) { p++; if (isOp(")")) break; continue; }
               break;
             }
@@ -230,7 +317,7 @@
       if (!t) syntax("unexpected end of expression");
       if (t.t === "num") { p++; return { k: "num", v: parseFloat(t.v) }; }
       if (t.t === "name") {
-        if (PY_KEYWORDS[t.v]) notAllowed(t.v);
+        if (own(PY_KEYWORDS, t.v)) notAllowed(t.v);
         p++; return { k: "name", v: t.v };
       }
       if (isOp("(")) {
@@ -238,7 +325,7 @@
         if (isOp(")")) notAllowed("Tuple");
         var inner = arith();
         var nt = peek();
-        if (nt && nt.t === "name" && PY_KEYWORDS[nt.v]) notAllowed(nt.v);
+        if (nt && nt.t === "name" && own(PY_KEYWORDS, nt.v)) notAllowed(nt.v);
         if (isOp(",")) notAllowed("Tuple");
         if (!isOp(")")) syntax("expected )");
         p++;
@@ -251,7 +338,7 @@
     if (p < toks.length) {
       var t = toks[p];
       if (t.t === "op" && t.v === ",") notAllowed("Tuple");
-      if (t.t === "name" && PY_KEYWORDS[t.v]) notAllowed(t.v);
+      if (t.t === "name" && own(PY_KEYWORDS, t.v)) notAllowed(t.v);
       syntax("unexpected '" + t.v + "'");
     }
     return tree;
@@ -261,9 +348,9 @@
     if (n.k === "bin") { calcValidate(n.l); calcValidate(n.r); }
     else if (n.k === "un") calcValidate(n.x);
     else if (n.k === "num") { if (Math.abs(n.v) > MAX_ABS) throw new Blocked("calc.number_too_large", "literal above 1e+15"); }
-    else if (n.k === "name") { if (!CONSTANTS.hasOwnProperty(n.v)) throw new Blocked("calc.unknown_name", "unknown name '" + n.v + "'; allowed constants: pi, e"); }
+    else if (n.k === "name") { if (!own(CONSTANTS, n.v)) throw new Blocked("calc.unknown_name", "unknown name '" + n.v + "'; allowed constants: pi, e"); }
     else if (n.k === "call") {
-      if (!FUNCTIONS.hasOwnProperty(n.f)) throw new Blocked("calc.function_not_allowed", "function '" + n.f + "' is not allowed; allowed: " + Object.keys(FUNCTIONS).join(", "));
+      if (!own(FUNCTIONS, n.f)) throw new Blocked("calc.function_not_allowed", "function '" + n.f + "' is not allowed; allowed: " + Object.keys(FUNCTIONS).join(", "));
       var lim = FUNCTIONS[n.f];
       if (n.args.length < lim[0] || n.args.length > lim[1]) throw new Blocked("calc.bad_arity", n.f + "() takes " + lim[0] + "-" + lim[1] + " arguments, got " + n.args.length);
       n.args.forEach(calcValidate);
@@ -283,15 +370,56 @@
   }
   function size(v) {
     if (!isFinite(v)) throw new Blocked("calc.result_too_large", "result is not a finite number");
-    if (Math.abs(v) > MAX_ABS) throw new Blocked("calc.result_too_large", "intermediate result above 1e+15");
+    if (Math.abs(v) > MAX_ABS) throw new Blocked("calc.result_too_large", "result above 1e+15");
     return v;
   }
+  function isInt(x) { return x === Math.trunc(x); }
+
+  // Python's round(x, nd): the exact binary value of x, rounded half to even at
+  // 10^-nd, then the nearest double to that decimal (what CPython does through
+  // dtoa). round(2.675, 2) is 2.67 because 2.675 is stored as 2.67499999...
   function pyRound(x, nd) {
-    var f = Math.pow(10, nd), m = x * f, r = Math.round(m);
-    if (Math.abs(m - Math.trunc(m)) === 0.5) r = 2 * Math.round(m / 2);
-    return r / f;
+    if (x === 0 || !isFinite(x)) return x;
+    var dv = new DataView(new ArrayBuffer(8));
+    dv.setFloat64(0, x);
+    var hi = dv.getUint32(0), lo = dv.getUint32(4);
+    var neg = (hi >>> 31) === 1, expBits = (hi >>> 20) & 0x7ff;
+    var mant = (BigInt(hi & 0xfffff) << BigInt(32)) | BigInt(lo), e2;
+    if (expBits === 0) e2 = -1074; else { mant = mant | (BigInt(1) << BigInt(52)); e2 = expBits - 1075; }
+    var num = mant, den = BigInt(1), ten = BigInt(10);
+    if (e2 >= 0) num = num << BigInt(e2); else den = den << BigInt(-e2);
+    if (nd >= 0) num = num * (ten ** BigInt(nd)); else den = den * (ten ** BigInt(-nd));
+    var q = num / den, twice = (num - q * den) * BigInt(2);
+    if (twice > den || (twice === den && (q % BigInt(2)) === BigInt(1))) q = q + BigInt(1);
+    return Number((neg ? "-" : "") + q.toString() + "e" + (-nd));
   }
-  function calcEval(n) {
+  // CPython float_divmod / float_rem: fmod, then fix the sign; the quotient is
+  // (a - mod) / b, floored, and nudged up when it lands just below an integer.
+  // Integers below 2**53 come out exactly as Python's int // and %.
+  function pyMod(a, b) {
+    var mod = a % b;
+    if (mod) { if ((b < 0) !== (mod < 0)) mod += b; } else mod = b < 0 ? -0 : 0;
+    return mod;
+  }
+  function pyFloorDiv(a, b) {
+    var mod = a % b, div = (a - mod) / b, fl;
+    if (mod && ((b < 0) !== (mod < 0))) div -= 1;
+    if (div) { fl = Math.floor(div); if (div - fl > 0.5) fl += 1; }
+    else fl = (a / b) < 0 ? -0 : 0;
+    return fl;
+  }
+  // Python int ** int (b >= 0) is exact; square-and-multiply is exact while the
+  // result stays below 2**53, and anything larger is refused by size() anyway.
+  function pyPow(a, b) {
+    if (isInt(a) && isInt(b) && b >= 0) {
+      var r = 1, base = a, e = b;
+      while (e > 0) { if (e % 2 === 1) r *= base; e = Math.floor(e / 2); if (e > 0) base *= base; }
+      return r;
+    }
+    return Math.pow(a, b);
+  }
+  function calcEval(n) { return size(calcEvalNode(n)); }
+  function calcEvalNode(n) {
     if (n.k === "num") return n.v;
     if (n.k === "name") return CONSTANTS[n.v];
     if (n.k === "un") { var v = calcEval(n.x); return n.op === "-" ? -v : v; }
@@ -302,15 +430,15 @@
       else if (n.op === "-") r = a - b;
       else if (n.op === "*") r = a * b;
       else if (n.op === "/") r = a / b;
-      else if (n.op === "//") r = Math.floor(a / b);
-      else if (n.op === "%") r = a - b * Math.floor(a / b);
+      else if (n.op === "//") r = pyFloorDiv(a, b);
+      else if (n.op === "%") r = pyMod(a, b);
       else {
         if (Math.abs(b) > MAX_EXPONENT) throw new Blocked("calc.exponent_too_large", "exponent " + b + " is above " + MAX_EXPONENT);
         if (a < 0 && b !== Math.trunc(b)) throw new Blocked("calc.math_domain", "negative number to a fractional power");
         if (a === 0 && b < 0) throw new Blocked("calc.division_by_zero", "division by zero");
-        r = Math.pow(a, b);
+        r = pyPow(a, b);
       }
-      return size(r);
+      return r;
     }
     var args = n.args.map(calcEval);
     if (n.f === "abs") return Math.abs(args[0]);
@@ -330,7 +458,8 @@
 
   function checkCalc(expr) {
     try {
-      if (expr.length > MAX_CALC_CHARS) throw new Blocked("calc.too_long", expr.length + " characters, limit is " + MAX_CALC_CHARS);
+      var exprLen = cpLen(expr);
+      if (exprLen > MAX_CALC_CHARS) throw new Blocked("calc.too_long", exprLen + " characters, limit is " + MAX_CALC_CHARS);
       if (!expr.trim()) throw new Blocked("calc.empty", "empty expression");
       if (!CALC_ALLOWED.test(expr)) {
         var bad = Array.from(expr).filter(function (ch) { return !CALC_ALLOWED.test(ch); })[0];
@@ -396,7 +525,8 @@
       var m = HIDDEN_CHARS.exec(fields[i][1]);
       if (m) return { allowed: false, rule: "search.hidden_chars", detail: fields[i][0] + " contains invisible or control character " + hex(m[0]) };
     }
-    if (query.length > MAX_QUERY_CHARS) return { allowed: false, rule: "search.query_too_long", detail: "query is " + query.length + " characters, limit is " + MAX_QUERY_CHARS };
+    var qLen = cpLen(query);
+    if (qLen > MAX_QUERY_CHARS) return { allowed: false, rule: "search.query_too_long", detail: "query is " + qLen + " characters, limit is " + MAX_QUERY_CHARS };
     if (!/[a-z0-9]/.test(query.toLowerCase())) return { allowed: false, rule: "search.empty_query", detail: "query has no searchable words" };
     if (QUERY_PATH.test(query)) return { allowed: false, rule: "search.path_traversal", detail: "query looks like a file path; search takes words, not paths" };
     if (doc != null) {
@@ -425,38 +555,75 @@
     },
     calculator: { expression: { type: "string", min: 1, max: MAX_CALC_CHARS, required: true } }
   };
+  // Same order as pydantic: fields in definition order, then extra fields.
   function checkSchema(tool, args) {
+    if (!own(SCHEMA, tool)) return { allowed: false, rule: "protocol.unknown_tool", detail: "no tool named '" + tool + "'" };
+    if (typeof args === "string") {
+      try { args = JSON.parse(args); }
+      catch (e) { return { allowed: false, rule: "schema.invalid_json", detail: "arguments are not valid JSON" }; }
+    }
     var spec = SCHEMA[tool];
-    if (!spec) return { allowed: false, rule: "protocol.unknown_tool", detail: "no tool named '" + tool + "'" };
     if (typeof args !== "object" || args === null || Array.isArray(args)) return { allowed: false, rule: "schema.wrong_type", detail: "arguments must be a JSON object" };
-    var keys = Object.keys(spec), k, f, v;
-    for (k in args) if (!spec.hasOwnProperty(k)) return { allowed: false, rule: "schema.extra_field", detail: k + ": Extra inputs are not permitted" };
+    var keys = Object.keys(spec), k, f, v, len;
     for (var i = 0; i < keys.length; i++) {
-      k = keys[i]; f = spec[k]; v = args[k];
+      k = keys[i]; f = spec[k]; v = own(args, k) ? args[k] : undefined;
       if (v === undefined) { if (f.required) return { allowed: false, rule: "schema.missing_field", detail: k + ": Field required" }; continue; }
       if (v === null && f.nullable) continue;
       if (f.type === "string") {
         if (typeof v !== "string") return { allowed: false, rule: "schema.wrong_type", detail: k + ": Input should be a valid string" };
-        if (f.min && v.length < f.min) return { allowed: false, rule: "schema.too_short", detail: k + ": String should have at least " + f.min + " character" };
-        if (v.length > f.max) return { allowed: false, rule: "schema.too_long", detail: k + ": String should have at most " + f.max + " characters" };
+        len = cpLen(v);
+        if (f.min && len < f.min) return { allowed: false, rule: "schema.too_short", detail: k + ": String should have at least " + f.min + " character" };
+        if (len > f.max) return { allowed: false, rule: "schema.too_long", detail: k + ": String should have at most " + f.max + " characters" };
       } else if (f.type === "integer") {
         if (typeof v !== "number" || v !== Math.trunc(v)) return { allowed: false, rule: "schema.wrong_type", detail: k + ": Input should be a valid integer" };
         if (v < f.lo || v > f.hi) return { allowed: false, rule: "schema.out_of_range", detail: k + ": must be between " + f.lo + " and " + f.hi };
       }
     }
+    for (k in args) if (own(args, k) && !own(spec, k)) return { allowed: false, rule: "schema.extra_field", detail: k + ": Extra inputs are not permitted" };
     return { allowed: true, rule: "schema.ok", detail: "arguments match the schema" };
+  }
+
+  // One active disposable worker. A new submission cancels the previous one.
+  // Startup has a separate deadline; the query clock starts only after ready.
+  function createSqlRunner(factory, queryMs, startupMs) {
+    var cancel = null;
+    return function (sql, bytes) {
+      if (cancel) cancel();
+      return new Promise(function (resolve) {
+        var worker, timer, finished = false, started = false;
+        function finish(reply) {
+          if (finished) return;
+          finished = true; clearTimeout(timer);
+          if (worker) worker.terminate();
+          cancel = null; resolve(reply);
+        }
+        cancel = function () { finish({error: {rule: "db.cancelled", detail: "superseded by another query"}}); };
+        timer = setTimeout(function () { finish({error: {rule: "db.error", detail: "SQL worker startup timed out"}}); }, startupMs || 15000);
+        try { worker = factory(); }
+        catch (e) { finish({error: {rule: "db.error", detail: String(e)}}); return; }
+        worker.onerror = function (e) { finish({error: {rule: "db.error", detail: e.message || "SQL worker failed"}}); };
+        worker.onmessage = function (e) {
+          if (finished) return;
+          if (e.data.ready && !started) {
+            started = true; clearTimeout(timer);
+            timer = setTimeout(function () { finish({error: {rule: "db.too_slow", detail: "query worker terminated: time budget exceeded"}}); }, queryMs || 2000);
+            worker.postMessage({sql: sql, bytes: bytes});
+          } else if (!e.data.ready) finish(e.data);
+        };
+      });
+    };
   }
 
   var api = {
     checkSql: checkSql, checkCalc: checkCalc, checkSearch: checkSearch, checkSchema: checkSchema,
-    BM25: BM25, injectionFlags: injectionFlags, MAX_ROWS: MAX_ROWS
+    BM25: BM25, injectionFlags: injectionFlags, MAX_ROWS: MAX_ROWS, createSqlRunner: createSqlRunner
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
+  else globalThis.GuardAgent = api;
   if (typeof document === "undefined") return;
 
   // ================================================================== page
-  var SQLJS_BASE = "https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.13.0/";
-  var state = { dbBytes: null, SQL: null, docs: [], bm25: null, data: null, model: 0, scenario: 0, tool: "sql_query" };
+  var state = { dbBytes: null, docs: [], bm25: null, data: null, model: 0, scenario: 0, tool: "sql_query" };
 
   var EXAMPLES = {
     sql_query: [
@@ -597,22 +764,24 @@
     }
   }
 
+  var runSql = createSqlRunner(function () { return new Worker("sql-worker.js"); });
   function execSql(sql, out, stages) {
-    if (!state.SQL || !state.dbBytes) {
-      stages.appendChild(stageRow("SQLite (sql.js)", "skip", "database still loading"));
+    if (!state.dbBytes) {
+      stages.appendChild(stageRow("SQLite worker", "skip", "database still loading"));
       return;
     }
-    var db = new state.SQL.Database(state.dbBytes);  // fresh copy per query: nothing persists
-    try {
-      var r = db.exec(sql);
-      var t = r[0] || { columns: [], values: [] };
-      stages.appendChild(stageRow("SQLite (sql.js, fresh in-memory copy)", "pass", t.values.length + " row(s)"));
-      out.appendChild(table(t.columns, t.values.slice(0, MAX_ROWS)));
-    } catch (e) {
-      stages.appendChild(stageRow("SQLite (sql.js)", "fail", String(e.message || e)));
-    } finally {
-      db.close();
-    }
+    var pending = stageRow("SQLite worker", "pending", "running with a time and memory budget");
+    stages.appendChild(pending);
+    runSql(sql, state.dbBytes).then(function (reply) {
+      // A newer request may have replaced this panel while the worker ran.
+      if (!out.contains(stages)) return;
+      pending.remove();
+      if (reply.error) stages.appendChild(stageRow("SQLite worker", "fail", reply.error.rule + ": " + reply.error.detail));
+      else {
+        stages.appendChild(stageRow("SQLite worker (fresh read-only copy)", "pass", reply.result.row_count + " row(s)"));
+        out.appendChild(table(reply.result.columns, reply.result.rows));
+      }
+    });
   }
 
   function table(cols, rows) {
@@ -633,7 +802,7 @@
   }
 
   // ---------------- results + recorded scenarios
-  var OUTCOME_LABEL = { guard_blocked: "Guard blocked", model_declined: "Model declined", got_through: "Got through" };
+  var OUTCOME_LABEL = { guard_blocked: "Guard blocked", model_declined: "Model declined", got_through: "Got through", inconclusive: "Inconclusive" };
 
   function configLabel(m) { return m.model + (m.condition === "compromised" ? " (compromised)" : ""); }
 
@@ -641,15 +810,15 @@
     var d = state.data, wrap = $("results-table");
     var tb = el("table", "results");
     var head = el("tr");
-    ["Model", "Condition", "Attacks", "Model declined", "Guard blocked", "Got through", "Normal tasks correct", "False-positive blocks"].forEach(function (h, i) { head.appendChild(el("th", i > 1 ? "num" : null, h)); });
+    ["Model", "Condition", "Attacks", "Model declined", "Guard blocked", "Got through", "Inconclusive", "Normal tasks correct", "False-positive blocks"].forEach(function (h, i) { head.appendChild(el("th", i > 1 ? "num" : null, h)); });
     var thead = el("thead"); thead.appendChild(head); tb.appendChild(thead);
     var body = el("tbody");
     d.models.forEach(function (m) {
       var s = m.summary, row = el("tr"), hasNormal = s.normal_total > 0;
       row.appendChild(el("th", null, m.model));
       var cond = el("td", null, m.condition); cond.setAttribute("data-label", "Condition"); row.appendChild(cond);
-      var labels = ["Attacks", "Model declined", "Guard blocked", "Got through", "Normal tasks correct", "False-positive blocks"];
-      [s.attacks_total, s.model_declined, s.guard_blocked, s.got_through,
+      var labels = ["Attacks", "Model declined", "Guard blocked", "Got through", "Inconclusive", "Normal tasks correct", "False-positive blocks"];
+      [s.attacks_total, s.model_declined, s.guard_blocked, s.got_through, s.inconclusive,
        hasNormal ? s.normal_correct + " / " + s.normal_total : "not run",
        hasNormal ? s.normal_false_positive_blocks : "not run"].forEach(function (v, i) {
         var td = el("td", "num", String(v)); td.setAttribute("data-label", labels[i]); row.appendChild(td);
@@ -783,12 +952,14 @@
     fetch("data/docs.json").then(function (r) { return r.json(); }).then(function (docs) {
       state.docs = docs; state.bm25 = new BM25(docs);
     });
-    var sqlReady = window.initSqlJs ? window.initSqlJs({ locateFile: function (f) { return SQLJS_BASE + f; } }) : Promise.reject(new Error("sql.js did not load"));
-    Promise.all([sqlReady, fetch("data/shop.db").then(function (r) { return r.arrayBuffer(); })]).then(function (x) {
-      state.SQL = x[0]; state.dbBytes = new Uint8Array(x[1]);
-      $("db-status").textContent = "Database loaded in your browser (sql.js).";
+    fetch("data/shop.db").then(function (r) {
+      if (!r.ok) throw new Error("database download failed");
+      return r.arrayBuffer();
+    }).then(function (bytes) {
+      state.dbBytes = new Uint8Array(bytes);
+      $("db-status").textContent = "Database ready. SQL runs in a disposable worker.";
       runGuard();
-    }).catch(function (e) { $("db-status").textContent = "Could not load sql.js: " + e.message + ". Guard verdicts still work."; runGuard(); });
+    }).catch(function (e) { $("db-status").textContent = "Could not load database: " + e.message; });
 
     fetch("data/scenarios.json").then(function (r) { return r.json(); }).then(function (d) {
       state.data = d;

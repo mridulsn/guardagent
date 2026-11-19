@@ -19,9 +19,10 @@ MAX_ABS = 1e15        # any literal or intermediate result above this is refused
 MAX_EXPONENT = 64
 
 ALLOWED_CHARS = re.compile(r"[0-9A-Za-z_ \t.,+\-*/%()]*")
-# Hex/octal/binary literals, complex literals and digit separators are valid
+# Hex/octal/binary literals (including 0x_f, where Python allows a separator
+# right after the prefix), complex literals and digit separators are valid
 # Python but not ordinary arithmetic; refusing them keeps the JS port simple.
-NUMBER_FORMAT = re.compile(r"\b0[xXoObB][0-9a-fA-F]|\d[jJ]\b|\d_\d")
+NUMBER_FORMAT = re.compile(r"\b0[xXoObB]|\d[jJ]\b|\d_\d")
 
 FUNCTIONS = {
     "abs": (1, 1),
@@ -148,11 +149,16 @@ def _check_size(v: float | int) -> float | int:
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         raise CalcBlocked("calc.result_too_large", "result is not a finite number")
     if abs(v) > MAX_ABS:
-        raise CalcBlocked("calc.result_too_large", f"intermediate result above {MAX_ABS:.0e}")
+        raise CalcBlocked("calc.result_too_large", f"result above {MAX_ABS:.0e}")
     return v
 
 
 def _eval(node: ast.AST) -> float | int:
+    """Evaluate one node. Every result, including function returns, is size-checked."""
+    return _check_size(_eval_node(node))
+
+
+def _eval_node(node: ast.AST) -> float | int:
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.Name):
@@ -187,7 +193,7 @@ def _eval(node: ast.AST) -> float | int:
             raise CalcBlocked("calc.division_by_zero", "division by zero")
         except OverflowError:
             raise CalcBlocked("calc.result_too_large", "result overflowed")
-        return _check_size(r)
+        return r
     if isinstance(node, ast.Call):
         args = [_eval(a) for a in node.args]
         name = node.func.id

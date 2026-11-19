@@ -26,7 +26,7 @@ def test_writes_refused_without_guard(ex, sql):
     before = db_fingerprint()
     with pytest.raises(DbError) as e:
         ex.run(sql)
-    assert e.value.rule in ("db.write_refused", "db.error")
+    assert e.value.rule in ("db.write_refused", "db.function_refused", "db.error")
     assert db_fingerprint() == before
 
 

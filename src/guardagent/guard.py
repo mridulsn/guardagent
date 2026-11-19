@@ -23,10 +23,20 @@ from .search import MAX_QUERY_CHARS, MAX_TOP_K, check_search, injection_flags
 from .sqlguard import MAX_ROWS, MAX_SQL_CHARS, check_sql
 from .tools import DbError, SearchExecutor, SqlExecutor
 
-# Rows one run may read in total. The per-query cap alone does not stop a bulk
-# export: a model can page through a table with LIMIT 50 OFFSET n (one recorded
-# run did exactly that before this budget existed).
+# Rows one run may get back in total. The per-query cap alone does not stop
+# paging: a model can walk a table with LIMIT 50 OFFSET n (one recorded run did
+# exactly that before this budget existed). This counts RETURNED rows, so it is
+# not an export boundary on its own: one returned value can encode many records.
+# The database allowlist refuses the aggregate functions that do that
+# (group_concat, json_group_array, ...), but a recursive CTE can still build such
+# a value with ||, within the 100,000-byte value limit.
 MAX_RUN_ROWS = 150
+
+# Longest tool result sent back to the model. Results above it are cut by
+# structure (whole rows dropped, long page text shortened) so the model always
+# gets valid JSON that says what was cut.
+MODEL_RESULT_CHARS = 12_000
+LONG_CELL_CHARS = 500
 
 
 class SqlQueryArgs(BaseModel):
@@ -84,13 +94,54 @@ class Decision:
     flags: list[str] = field(default_factory=list)
 
     def result_text(self) -> str:
+        """Exactly what goes back to the model (and into the trace)."""
         if not self.allowed:
             return f"BLOCKED by guard rule {self.rule}: {self.detail}"
         if self.is_error:
             return f"ERROR ({self.rule}): {self.detail}"
-        body = json.dumps(self.result, ensure_ascii=True, default=str)
         note = f"[guard: {self.rule}: {self.detail}] " if self.verdict == "modified" else ""
+        body = _dump(self.result)
+        if len(note) + len(body) > MODEL_RESULT_CHARS:
+            body = _dump(fit_result(self.result, MODEL_RESULT_CHARS - len(note)))
         return note + body
+
+
+def _dump(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=True, default=str)
+
+
+def fit_result(result: Any, limit: int) -> Any:
+    """Shrink a tool result by structure until its JSON fits in `limit` characters."""
+    if not isinstance(result, dict):
+        return {"note": f"result cut: {len(_dump(result))} characters is above the {limit}-character limit"}
+    out = dict(result)
+    if "rows" in out:
+        rows = [[(v[:LONG_CELL_CHARS] + "...[cut]") if isinstance(v, str) and len(v) > LONG_CELL_CHARS else v
+                 for v in r] for r in out["rows"]]
+        k = len(rows)
+        while True:
+            out["rows"] = rows[:k]
+            out["rows_sent"] = k
+            out["note"] = (f"cut to {k} of {len(rows)} rows (long values shortened) to fit the "
+                           f"{limit}-character result limit")
+            if len(_dump(out)) <= limit:
+                return out
+            if k == 0:
+                break
+            k -= 1
+    if "hits" in out:
+        hits = [dict(h) for h in out["hits"]]
+        out["hits"] = hits
+        out["note"] = f"page text shortened to fit the {limit}-character result limit"
+        while len(_dump(out)) > limit:
+            longest = max(hits, key=lambda h: len(h.get("text", "")), default=None)
+            if longest is None or not longest.get("text"):
+                break
+            longest["text"] = longest["text"][:len(longest["text"]) // 2]
+            longest["text_cut"] = True
+        if len(_dump(out)) <= limit:
+            return out
+    return {"note": f"result cut: {len(_dump(result))} characters is above the {limit}-character limit"}
 
 
 class AuditLog:
@@ -121,6 +172,25 @@ class AuditLog:
         return entry
 
 
+def check_schema(tool: str, raw_input: Any) -> tuple[BaseModel | None, str, str, str]:
+    """Protocol and schema layer. Returns (parsed args or None, rule, layer, detail)."""
+    if tool not in SCHEMAS:
+        return None, "protocol.unknown_tool", "protocol", f"no tool named {tool!r}; tools are {', '.join(SCHEMAS)}"
+    args_in = raw_input
+    if isinstance(args_in, str):
+        try:
+            args_in = json.loads(args_in)
+        except json.JSONDecodeError as e:
+            return None, "schema.invalid_json", "schema", f"arguments are not valid JSON: {e.msg}"
+    if not isinstance(args_in, dict):
+        return None, "schema.wrong_type", "schema", "arguments must be a JSON object"
+    try:
+        return SCHEMAS[tool].model_validate(args_in), "schema.ok", "schema", "arguments match the schema"
+    except ValidationError as e:
+        rule, detail = schema_rule(e)
+        return None, rule, "schema", detail
+
+
 class GuardLayer:
     def __init__(self, db_path: Path = DB_PATH, audit: AuditLog | None = None, search: SearchExecutor | None = None):
         self.sql = SqlExecutor(db_path)
@@ -143,21 +213,9 @@ class GuardLayer:
         def block(rule: str, layer: str, detail: str) -> Decision:
             return Decision(tool, raw_input, False, "blocked", rule, layer, detail, is_error=True)
 
-        if tool not in SCHEMAS:
-            return block("protocol.unknown_tool", "protocol", f"no tool named {tool!r}; tools are {', '.join(SCHEMAS)}")
-        args_in = raw_input
-        if isinstance(args_in, str):
-            try:
-                args_in = json.loads(args_in)
-            except json.JSONDecodeError as e:
-                return block("schema.invalid_json", "schema", f"arguments are not valid JSON: {e.msg}")
-        if not isinstance(args_in, dict):
-            return block("schema.wrong_type", "schema", "arguments must be a JSON object")
-        try:
-            args = SCHEMAS[tool].model_validate(args_in)
-        except ValidationError as e:
-            rule, detail = schema_rule(e)
-            return block(rule, "schema", detail)
+        args, rule, layer, detail = check_schema(tool, raw_input)
+        if args is None:
+            return block(rule, layer, detail)
 
         if tool == "sql_query":
             v = check_sql(args.query)

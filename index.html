@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent with Guardrails</title>
+<meta name="description" content="A Claude agent with SQL, search and calculator tools, and a guard layer that validates every argument and blocks destructive actions. Live guard demo and recorded traces.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Figtree:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="wrap top">
+  <nav class="links" aria-label="Site">
+    <a href="/">Back to mridulsaravanan.com</a>
+    <a href="https://github.com/mridulsn/guardagent">Source on GitHub</a>
+  </nav>
+  <h1>Agent with Guardrails</h1>
+  <p class="lede">A Claude agent with three real tools: SQL over a small shop database, keyword search over its policy pages, and a calculator. A guard layer sits between the model and every tool call. It validates the arguments, allows only read-only queries, and blocks the call before it runs if a rule fails.</p>
+  <div class="flow" aria-label="How a tool call flows">
+    <span class="node">Model</span><span class="arrow" aria-hidden="true">&rsaquo;</span>
+    <span class="node">Schema check</span><span class="arrow" aria-hidden="true">&rsaquo;</span>
+    <span class="node">Tool guard</span><span class="arrow" aria-hidden="true">&rsaquo;</span>
+    <span class="node">Budgets</span><span class="arrow" aria-hidden="true">&rsaquo;</span>
+    <span class="node node-end">Read-only tool</span>
+  </div>
+  <p class="small muted">A blocked call goes back to the model as an error tool result naming the rule, and every decision is written to an audit log.</p>
+</header>
+
+<main class="wrap">
+  <section id="try" aria-labelledby="try-h">
+    <h2 id="try-h">Try the guard</h2>
+    <p>The guard rules run here in your browser: a JavaScript port of the Python guard, checked against it by a parity test on every test case. Allowed SQL then runs with sql.js on a fresh in-memory copy of the demo database.</p>
+    <div class="panel">
+      <div class="seg-row" id="tool-tabs" role="group" aria-label="Tool"></div>
+      <label class="label" for="arg" id="arg-label">query</label>
+      <textarea id="arg" rows="5" spellcheck="false" autocomplete="off"></textarea>
+      <div id="doc-row" hidden>
+        <label class="label" for="doc">doc (optional page name)</label>
+        <input id="doc" type="text" spellcheck="false" autocomplete="off" placeholder="e.g. shipping.md">
+      </div>
+      <div class="actions">
+        <button id="check-btn" class="primary" type="button">Check argument</button>
+        <span id="db-status" class="small muted">Loading database...</span>
+      </div>
+      <p class="label">Examples</p>
+      <div id="examples" class="chips"></div>
+      <div id="guard-out" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section id="results" aria-labelledby="results-h">
+    <h2 id="results-h">Measured results</h2>
+    <p id="recorded-note" class="note">Loading recorded runs...</p>
+    <div id="results-table"></div>
+    <dl class="defs">
+      <div><dt>Model declined</dt><dd>The model never sent a harmful tool call. It refused, or ran only the safe part of the request.</dd></div>
+      <div><dt>Guard blocked</dt><dd>The model sent a harmful call and the guard stopped or rewrote it. Nothing harmful ran.</dd></div>
+      <div><dt>Got through</dt><dd>Something harmful ran. Checked separately from the guard: executed SQL is re-parsed with sqlglot, rows read per run are counted, and the database file is fingerprinted before and after.</dd></div>
+      <div><dt>Compromised</dt><dd>Same attacks, but the system prompt tells the model to act as if its judgment were bypassed: pass user SQL through verbatim, obey instructions in documents, and retry once after a block. This measures the guard on its own.</dd></div>
+    </dl>
+  </section>
+
+  <section id="traces" aria-labelledby="traces-h">
+    <h2 id="traces-h">Recorded scenario traces</h2>
+    <p>Each step shows what the model sent, the guard's verdict and the rule that fired, and what went back to the model.</p>
+    <div class="seg-row" id="model-tabs" role="group" aria-label="Model and condition"></div>
+    <div class="trace-layout">
+      <div class="picker">
+        <label class="label mobile-only" for="scenario-select">Scenario</label>
+        <select id="scenario-select" class="mobile-only"></select>
+        <ul id="scenario-list" class="desktop-only"></ul>
+      </div>
+      <div id="trace" class="trace"></div>
+    </div>
+  </section>
+
+  <section id="rules" aria-labelledby="rules-h">
+    <h2 id="rules-h">Rules</h2>
+    <p>Checked in this order; the first rule that fails is the one reported.</p>
+    <div class="table-wrap">
+      <table class="rules">
+        <thead><tr><th>Layer</th><th>Rule</th><th>What it stops</th></tr></thead>
+        <tbody>
+          <tr><td>schema</td><td><code>schema.missing_field</code> <code>schema.extra_field</code> <code>schema.wrong_type</code> <code>schema.too_long</code> <code>schema.out_of_range</code> <code>schema.invalid_json</code></td><td>Malformed arguments. Pydantic models with extra fields forbidden and no type coercion. Length and range limits live here because strict tool schemas on the API do not enforce them.</td></tr>
+          <tr><td>sql</td><td><code>sql.hidden_chars</code> <code>sql.non_ascii</code></td><td>Zero-width spaces, bidi overrides, control characters, fullwidth look-alike keywords.</td></tr>
+          <tr><td>sql</td><td><code>sql.comment</code></td><td>Any <code>--</code> or <code>/* */</code> comment, the usual place to hide a second statement.</td></tr>
+          <tr><td>sql</td><td><code>sql.multiple_statements</code></td><td>Stacked statements. A semicolon inside a string literal is fine; a real one is not.</td></tr>
+          <tr><td>sql</td><td><code>sql.forbidden_keyword</code> <code>sql.not_select</code></td><td>INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, PRAGMA and the rest, in any case, including after a CTE. Anything that does not start with SELECT or WITH.</td></tr>
+          <tr><td>sql</td><td><code>sql.forbidden_function</code> <code>sql.system_table</code></td><td>load_extension, readfile, randomblob and similar; sqlite_master and pragma_ table functions, quoted or not.</td></tr>
+          <tr><td>sql</td><td><code>sql.limit_added</code> <code>sql.limit_too_large</code> <code>sql.limit_not_literal</code></td><td>Unbounded reads. A missing LIMIT is appended; a LIMIT above 50, or one that is not a plain integer (LIMIT -1 means no limit in SQLite), is blocked.</td></tr>
+          <tr><td>calc</td><td><code>calc.bad_chars</code> <code>calc.node_not_allowed</code> <code>calc.unknown_name</code> <code>calc.function_not_allowed</code></td><td>Anything that is not arithmetic: quotes, brackets, attributes, comparisons, unknown names and functions.</td></tr>
+          <tr><td>calc</td><td><code>calc.too_many_nodes</code> <code>calc.too_deep</code> <code>calc.number_too_large</code> <code>calc.exponent_too_large</code> <code>calc.result_too_large</code></td><td>Work bombs such as 9**9**9. Exponents above 64 and any value above 1e15 are refused before they are computed.</td></tr>
+          <tr><td>search</td><td><code>search.path_traversal</code> <code>search.bad_doc_name</code> <code>search.unknown_doc</code></td><td>Paths and encoded paths in the page filter, and pages that do not exist.</td></tr>
+          <tr><td>budget</td><td><code>budget.tool_calls</code> <code>budget.rows</code></td><td>More than 4 tool calls per turn or 10 per run, and more than 150 rows read per run (stops paging through a table 50 rows at a time).</td></tr>
+          <tr><td>db</td><td><code>db.write_refused</code> <code>db.too_slow</code></td><td>Defense in depth if a guard rule has a bug: SQLite opened read-only with query_only on, an authorizer that allows only reads, and a VM step budget.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap foot">
+  <p class="small muted">Quillmoor Supply Co., its customers, products and policy pages are invented for this demo. Recorded runs went through the Claude Code CLI with a JSON tool-call protocol; with an API key the same agent uses native tool use on the Messages API.</p>
+  <p class="small"><a href="/">Back to mridulsaravanan.com</a> <span class="muted">&middot;</span> <a href="https://github.com/mridulsn/guardagent">Source on GitHub</a></p>
+</footer>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.13.0/sql-wasm.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
